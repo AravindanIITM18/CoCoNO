@@ -1,7 +1,7 @@
 import inspect
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import openai,re
 import logging
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ import torch.utils.checkpoint as checkpoint
 from torch.nn import functional as F
 from torch.optim.adam import Adam
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
-
+from PIL import Image
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin, FromSingleFileMixin, IPAdapterMixin
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
@@ -23,18 +23,30 @@ from diffusers.utils import (
     scale_lora_layers,
     unscale_lora_layers,
 )
+import seaborn as sns
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
 from utils.ptp_utils import AttendExciteAttnProcessor, AttentionStore
-from utils.attn_utils import fn_show_attention, fn_smoothing_func, fn_get_topk, fn_clean_mask, fn_get_otsu_mask
+from utils.attn_utils import fn_show_attention, fn_smoothing_func, fn_get_topk, fn_clean_mask, fn_get_otsu_mask, fn_show_attention_numpy
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+from scipy.optimize import linear_sum_assignment
+import torch
+from PIL import Image
+
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+
+from scipy.ndimage import label
+import cv2
 
 logging.basicConfig(format='%(asctime)s: %(message)s',level=logging.INFO)
+
+from sklearn.mixture import GaussianMixture
 
 
 EXAMPLE_DOC_STRING = """
@@ -159,6 +171,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
         """
         self.vae.enable_slicing()
+
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.disable_vae_slicing
     def disable_vae_slicing(self):
@@ -518,21 +531,287 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
+    def sigmoid(self, x):
+        return 1 / (1 + torch.exp(-16*x+10))
 
-    def fn_augmented_compute_losss(
-        self, 
+    def mod_sigmoid(self, SA_map):
+        return self.sigmoid(SA_map)
+
+    def otsu_thresholding(self, array):
+        # Convert PyTorch tensor to a NumPy array suitable for OpenCV
+        array_numpy = array.detach().cpu().numpy()
+        array_uint8 = (array_numpy * 255).astype(np.uint8)
+
+        # Apply Otsu thresholding
+        _, binary_array = cv2.threshold(array_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Convert back to tensor and retain requires_grad
+        binary_map = torch.tensor(binary_array, dtype=torch.float32, device=array.device)
+        binary_map.requires_grad = True
+        binary_map=binary_map/255.0
+        return binary_map
+    # def separate_islands(self, binary_map):
+    #     # Move tensor to CPU and convert to NumPy array
+    #     binary_map_cpu = binary_map.detach().cpu().numpy()
+        
+    #     # Label the connected components (islands) in the binary map
+    #     labeled_map, num_features = label(binary_map_cpu)
+        
+    #     # Create an array to store each island separately
+    #     separated_maps = np.zeros((num_features, 16, 16), dtype=int)
+        
+    #     for i in range(1, num_features + 1):
+    #         separated_maps[i - 1] = (labeled_map == i).astype(int)
+        
+    #     # Convert back to tensor
+    #     separated_maps_tensor = torch.tensor(separated_maps, dtype=torch.float32, requires_grad=True,device=binary_map.device)
+    #     return separated_maps_tensor
+    
+    def separate_islands(self, prob_maps):
+        """
+        Converts soft probability maps into separate self-attention segments.
+
+        Parameters:
+        - prob_maps: Tensor of shape (num_components, 16, 16) with soft cluster assignments.
+
+        Returns:
+        - SA_segments: Tensor of shape (num_components, 16, 16) representing the segmentation masks.
+        """
+        # separated_maps_tensor = torch.tensor(prob_maps, dtype=torch.float32, requires_grad=True,device=prob_maps.device)
+        separated_maps_tensor = prob_maps.clone().detach().to(prob_maps.device).requires_grad_(True)
+        return separated_maps_tensor
+        # return prob_maps  # Since GMM already provides soft assignments, return directly
+        
+    def adaptive_thresholding(self, array, method='mean', block_size=7, C=-8):
+        # Convert array to a format suitable for OpenCV (e.g., uint8)
+        array_numpy = array.detach().cpu().numpy()
+        array_uint8 = (array_numpy * 255).astype(np.uint8)
+
+        if method == 'mean':
+            adaptive_method = cv2.ADAPTIVE_THRESH_MEAN_C
+        elif method == 'gaussian':
+            adaptive_method = cv2.ADAPTIVE_THRESH_GAUSSIAN_C
+        else:
+            raise ValueError("Method should be 'mean' or 'gaussian'")
+
+        # Apply adaptive thresholding
+        binary_array = cv2.adaptiveThreshold(array_uint8, 255, adaptive_method, cv2.THRESH_BINARY, block_size, C)
+
+         # Convert back to tensor and retain requires_grad
+        binary_map = torch.tensor(binary_array, dtype=torch.float32, device=array.device)
+        binary_map.requires_grad = True
+        binary_map=binary_map/255.0
+        return binary_map
+    
+    def plot_heatmap(self,attention_map, title="Attention Map"):
+        # Convert to numpy array if it's a tensor
+        if isinstance(attention_map, torch.Tensor):
+            attention_map = attention_map.detach().cpu().numpy()
+
+        # Ensure the map is 2D
+        if attention_map.ndim != 2:
+            raise ValueError("Attention map must be a 2D array or tensor.")
+
+        plt.figure(figsize=(5,5))
+        sns.heatmap(attention_map, cmap='coolwarm', annot=False, cbar=True)
+        plt.title(title)
+        plt.show()
+        
+    def visualize_SA_map(self, SA_map, orig_image, seed): 
+            # Apply PCA using sklearn's PCA
+            flattened_tensor = SA_map.view(-1, 256)
+            pca = PCA(n_components=1)
+
+            # Convert tensor to numpy for PCA, then back to tensor without detaching
+            pca_result = pca.fit_transform(flattened_tensor.cpu().numpy())
+            first_component = torch.tensor(pca_result[:, 0], device=SA_map.device).view(16, 16)
+
+            # Normalize the first component to the range [0, 1]
+            first_component_image_normalized = (first_component - first_component.min()) / (first_component.max() - first_component.min())
+            self.plot_heatmap(first_component_image_normalized)
+            # Apply thresholding and separate islands
+            # first_component_image_normalized=self.mod_sigmoid(first_component_image_normalized)
+            binary_map = self.adaptive_thresholding(first_component_image_normalized)
+
+            separated_maps = self.separate_islands(binary_map)
+
+            return separated_maps
+    def calculate_intersection(self, segment, cross_attention_map):
+        return torch.sum(segment * cross_attention_map)
+    
+    def calculate_intersection1(self, segment, cross_attention_map):
+        return np.sum(segment * cross_attention_map)
+    # Function to create a cost matrix
+    def create_cost_matrix(self, self_attention_segments, cross_attention_maps):
+        num_segments = len(self_attention_segments)
+        num_nouns = len(cross_attention_maps)
+        cost_matrix = np.zeros((num_segments, num_nouns))
+        for i in range(num_segments):
+            for j in range(num_nouns):
+                cost_matrix[i, j] = -self.calculate_intersection(self_attention_segments[i], cross_attention_maps[j])
+        return cost_matrix
+
+    # Function to assign segments to nouns
+    def assign_segments_to_nouns(self, self_attention_segments, cross_attention_maps):
+        cost_matrix = self.create_cost_matrix(self_attention_segments, cross_attention_maps)
+        cost_matrix = np.nan_to_num(cost_matrix, nan=0.0)  # Replace NaNs with 0
+        cost_matrix = np.clip(cost_matrix, 1e-8, 1e6)  # Clamp values
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        assignments = list(zip(row_ind, col_ind))
+        return assignments
+    def visualize_SA_map(self, SA_map, orig_image, seed): 
+        # Apply PCA using sklearn's PCA
+        flattened_tensor = SA_map.view(-1, 256)
+        pca = PCA(n_components=1)
+
+        # Convert tensor to numpy for PCA, then back to tensor without detaching
+        pca_result = pca.fit_transform(flattened_tensor.cpu().numpy())
+        first_component = torch.tensor(pca_result[:, 0], device=SA_map.device).view(16, 16)
+
+        # Normalize the first component to the range [0, 1]
+        first_component_image_normalized = (first_component - first_component.min()) / (first_component.max() - first_component.min())
+
+        # Upscale the PCA map to match the image dimensions before thresholding
+        upscaled_pca_image_before = Image.fromarray((first_component_image_normalized.cpu().numpy() * 255).astype(np.uint8)).resize(orig_image.size, resample=Image.BILINEAR)
+        upscaled_pca_np_before = np.array(upscaled_pca_image_before)
+        colormap = plt.get_cmap('jet')
+        upscaled_pca_colored_before = colormap(upscaled_pca_np_before / 255.0)[:, :, :3]
+
+        # Apply thresholding and separate islands
+        first_component_image_normalized=self.mod_sigmoid(first_component_image_normalized)
+        binary_map = self.otsu_thresholding(first_component_image_normalized)
+        # print(binary_map)
+        # Upscale the PCA map to match the image dimensions after thresholding
+        upscaled_pca_image_after = Image.fromarray((binary_map * 255).astype(np.uint8)).resize(orig_image.size, resample=Image.BILINEAR)
+        upscaled_pca_np_after = np.array(upscaled_pca_image_after)
+        upscaled_pca_colored_after = colormap(upscaled_pca_np_after / 255.0)[:, :, :3]
+
+        # Convert image to numpy array for overlaying
+        image_np = np.array(orig_image)
+
+        # Ensure both arrays have compatible shapes
+        if image_np.shape[-1] == 3:
+            upscaled_pca_colored_before = (upscaled_pca_colored_before * 255).astype(np.uint8)
+            upscaled_pca_colored_after = (upscaled_pca_colored_after * 255).astype(np.uint8)
+
+        # Overlay the colormapped PCA maps on the image
+        alpha = 0.5
+        overlayed_image_before = (image_np * (1 - alpha) + upscaled_pca_colored_before * alpha).astype(np.uint8)
+        overlayed_image_after = (image_np * (1 - alpha) + upscaled_pca_colored_after * alpha).astype(np.uint8)
+
+        # Display the original and overlayed images side by side
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+        axs[0].imshow(orig_image)
+        axs[0].set_title("Original Image")
+        axs[0].axis('off')
+
+        axs[1].imshow(overlayed_image_before)
+        axs[1].set_title(f"Before Thresholding, seed: {seed}\n(Red = High, Blue = Low)")
+        axs[1].axis('off')
+
+        axs[2].imshow(overlayed_image_after)
+        axs[2].set_title(f"After Thresholding, seed: {seed}\n(Red = High, Blue = Low)")
+        axs[2].axis('off')
+
+        plt.show()
+
+        separated_maps = self.separate_islands(binary_map)
+
+        return separated_maps
+
+    def overlay_SA_over_image(self, binary_map,orig_image,text):
+        # Upscale the PCA map to match the image dimensions after thresholding
+        upscaled_pca_image = Image.fromarray((binary_map * 255).astype(np.uint8)).resize(orig_image.size, resample=Image.BILINEAR)
+        upscaled_pca_np = np.array(upscaled_pca_image)
+        upscaled_pca_colored= colormap(upscaled_pca_np / 255.0)[:, :, :3]
+
+        # Convert image to numpy array for overlaying
+        image_np = np.array(orig_image)
+
+        # Ensure both arrays have compatible shapes
+        if image_np.shape[-1] == 3:
+            upscaled_pca_colored= (upscaled_pca_colored * 255).astype(np.uint8)
+        # Overlay the colormapped PCA maps on the image
+        alpha = 0.5
+        overlayed_image = (image_np * (1 - alpha) + upscaled_pca_colored * alpha).astype(np.uint8)
+        # Display the overlayed image
+        plt.figure(figsize=(5,5))
+        plt.imshow(overlayed_image)
+        plt.title(text)
+        plt.axis('off')
+        plt.show()
+        
+    def PCA_on_SA_map(self, SA_map):
+        # Apply PCA using sklearn's PCA
+        flattened_tensor = SA_map.view(-1, 256)
+        pca = PCA(n_components=1)
+        pca_result = pca.fit_transform(flattened_tensor.cpu().detach().numpy())
+        # first_component = pca_result[:, 0].reshape(16, 16)
+        first_component = torch.tensor(pca_result[:, 0].reshape(16, 16), requires_grad=True)
+        # Normalize the first component to the range [0, 1]
+        first_component_image_normalized = (first_component - first_component.min()) / (first_component.max() - first_component.min())
+
+        # Apply thresholding and separate islands
+        first_component_image_normalized=self.mod_sigmoid(first_component_image_normalized)
+        binary_map = self.otsu_thresholding(first_component_image_normalized)
+        # self.plot_heatmap(binary_map)
+        # print(binary_map)
+        if not binary_map.requires_grad:
+            print("Error")
+        return binary_map
+    
+
+    def GMM_on_SA_map(self, SA_map, num_components):
+        """
+        Applies GMM clustering on the self-attention map.
+        
+        Parameters:
+        - SA_map: torch.Tensor of shape (16, 16, 256) representing self-attention.
+        - num_components: Number of GMM components (set as len(indices) + 1).
+
+        Returns:
+        - prob_maps: Tensor of shape (num_components, 16, 16) with soft cluster assignments.
+        """
+        H, W, C = SA_map.shape  # Should be (16, 16, 256)
+        attn_reshaped = SA_map.reshape(-1, C).cpu().detach().numpy()  # Flatten spatial dimensions
+
+        # Apply GMM with soft assignments
+        gmm = GaussianMixture(n_components=num_components, random_state=42)
+        gmm.fit(attn_reshaped)
+        prob_maps = gmm.predict_proba(attn_reshaped)  # Shape: (256, num_components)
+
+        # Reshape probability maps to (num_components, 16, 16)
+        prob_maps = torch.tensor(prob_maps.T.reshape(num_components, H, W), dtype=torch.float32, requires_grad=True, device=SA_map.device)
+        
+        return prob_maps
+    
+    def clean_and_normalize(self, losses_list):
+        # Convert the list to a NumPy array
+        return losses_list
+        losses_array = np.array(losses_list)
+
+        # Normalize the array with respect to its min and max values
+        min_value = np.min(losses_array)
+        max_value = np.max(losses_array)
+
+        return losses_array/max_value
+
+
+    def fn_our_augmented_compute_losss(self, 
         indices: List[int], 
+        prompt: str,                               
         smooth_attentions: bool = True,
-        K: int = 1,
-        attention_res: int = 16,) -> torch.Tensor:
+        attention_res: int = 16,
+    ) -> torch.Tensor:
 
-        # -----------------------------
-        # cross-attention response loss
-        # -----------------------------
+        # Aggregate cross and self-attention maps
         aggregate_cross_attention_maps = self.attention_store.aggregate_attention(
             from_where=("up", "down", "mid"), is_cross=True)
-        
-        # cross attention map preprocessing
+
+        self_attention_maps = self.attention_store.aggregate_attention(
+            from_where=("up", "down", "mid"), is_cross=False)
+        # Cross attention map preprocessing
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 1:-1]
         cross_attention_maps = cross_attention_maps * 100
         cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
@@ -540,213 +819,292 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         # Shift indices since we removed the first token
         indices = [index - 1 for index in indices]
 
-        # clean_cross_attention_loss
-        clean_cross_attn_loss = 0.
+        cross_attention_map_tensor, self_attention_map_tensor = fn_show_attention(
+            cross_attention_maps=cross_attention_maps,
+            self_attention_maps=self_attention_maps,
+            indices=len(prompt.split()),
+            K=1,
+            attention_res=attention_res,
+            smooth_attentions=True)
 
-        # Extract the maximum values
-        topk_value_list, topk_coord_list_list = [], []
+        # Perform GMM-based segmentation
+        # print(self_attention_maps.shape)
+        prob_maps = self.GMM_on_SA_map(SA_map=self_attention_maps, num_components=len(indices) + 1)
+        SA_segments = self.separate_islands(prob_maps)
+        SA_segments_tensor = SA_segments.clone().requires_grad_(True).to(self._execution_device)
+
+        # Initialize cross-attention maps tensor
+        CA_maps_tensor = torch.zeros((len(indices), attention_res, attention_res), dtype=torch.float32).requires_grad_(True).to(self._execution_device)
+
+        for idx, i in enumerate(indices):
+            CA_maps_tensor[idx] = cross_attention_map_tensor[attention_res * i:attention_res * (i + 1), :].clone()
+
+        assignments = self.assign_segments_to_nouns(SA_segments_tensor, CA_maps_tensor)
+
+        # L1 Loss Calculation
+        losses = []
+        for seg_idx, noun_idx in assignments:
+            loss_segment = self.calculate_intersection(SA_segments_tensor[seg_idx], CA_maps_tensor[noun_idx])
+            loss_segment = loss_segment / torch.sum(SA_segments_tensor[seg_idx])
+            losses.append(1 - loss_segment)
+
+        losses_tensor = torch.tensor(losses, requires_grad=True, device=self._execution_device)
+        L1 = torch.max(losses_tensor)
+
+        # L2 Loss Calculation
+        intersection_losses = []
+        for seg_idx, noun_idx in assignments:
+            loss_segment = sum(self.calculate_intersection(SA_segments_tensor[seg_idx], i) for i in CA_maps_tensor)
+            loss_segment -= self.calculate_intersection(SA_segments_tensor[seg_idx], CA_maps_tensor[noun_idx])
+            loss_segment = loss_segment / torch.sum(SA_segments_tensor[seg_idx])
+            intersection_losses.append(loss_segment)
+
+        intersection_losses = self.clean_and_normalize(intersection_losses)
+        losses_tensor = torch.tensor(intersection_losses, requires_grad=True, device=self._execution_device)
+        L2 = torch.max(losses_tensor)
+
+        # Compute IoU Matrix
+        num_segments = SA_segments_tensor.shape[0]
+        IoU_matrix = torch.zeros((num_segments, num_segments), device=self._execution_device, requires_grad=True)
+
+        for i in range(num_segments):
+            for j in range(i + 1, num_segments):
+                intersection = torch.sum(torch.min(SA_segments_tensor[i], SA_segments_tensor[j]))
+                union = torch.sum(torch.max(SA_segments_tensor[i], SA_segments_tensor[j]))
+                IoU_matrix = IoU_matrix.clone() 
+                IoU_matrix[i, j] = intersection / union if union > 0 else 0
+
+        # IoU-Based Loss Terms
+        IoU_upper_sum = torch.sum(torch.triu(IoU_matrix, diagonal=1))  # Sum of upper triangle
+        IoU_max = torch.max(IoU_matrix)  # Maximum overlap
+
+        # Clean Cross Attention Loss
+        clean_cross_attn_loss = 0.
         for i in indices:
             cross_attention_map_cur_token = cross_attention_maps[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
-            topk_coord_list, _ = fn_get_topk(cross_attention_map_cur_token, K=K)
-
-            topk_value = 0
-            for coord_x, coord_y in topk_coord_list: topk_value = topk_value + cross_attention_map_cur_token[coord_x, coord_y]
-            topk_value = topk_value / K
-
-            topk_value_list.append(topk_value)
-            topk_coord_list_list.append(topk_coord_list)
-
-            # -----------------------------------
-            # clean cross_attention_map_cur_token
-            # -----------------------------------
-            clean_cross_attention_map_cur_token                     = cross_attention_map_cur_token
-            clean_cross_attention_map_cur_token_mask                = fn_get_otsu_mask(clean_cross_attention_map_cur_token)
-            clean_cross_attention_map_cur_token_mask                = fn_clean_mask(clean_cross_attention_map_cur_token_mask, topk_coord_list[0][0], topk_coord_list[0][1])
-            clean_cross_attention_map_cur_token_foreground          = clean_cross_attention_map_cur_token * clean_cross_attention_map_cur_token_mask + (1 - clean_cross_attention_map_cur_token_mask)
-            clean_cross_attention_map_cur_token_background          = clean_cross_attention_map_cur_token * (1 - clean_cross_attention_map_cur_token_mask)
+            if smooth_attentions:
+                cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
+            clean_cross_attention_map_cur_token = cross_attention_map_cur_token
+            clean_cross_attention_map_cur_token_mask = fn_get_otsu_mask(clean_cross_attention_map_cur_token)
+            clean_cross_attention_map_cur_token_mask = fn_clean_mask(clean_cross_attention_map_cur_token_mask, 0, 0)
+            clean_cross_attention_map_cur_token_foreground = clean_cross_attention_map_cur_token * clean_cross_attention_map_cur_token_mask + (1 - clean_cross_attention_map_cur_token_mask)
+            clean_cross_attention_map_cur_token_background = clean_cross_attention_map_cur_token * (1 - clean_cross_attention_map_cur_token_mask)
 
             if clean_cross_attention_map_cur_token_background.max() > clean_cross_attention_map_cur_token_foreground.min():
-                clean_cross_attn_loss = clean_cross_attn_loss + clean_cross_attention_map_cur_token_background.max()
-            else: clean_cross_attn_loss = clean_cross_attn_loss + clean_cross_attention_map_cur_token_background.max() * 0
+                clean_cross_attn_loss += clean_cross_attention_map_cur_token_background.max()
+            else:
+                clean_cross_attn_loss += clean_cross_attention_map_cur_token_background.max() * 0
 
-        cross_attn_loss_list = [max(0 * curr_max, 1.0 - curr_max) for curr_max in topk_value_list]
-        cross_attn_loss = max(cross_attn_loss_list)
-
-        # ------------------------------
-        # cross attention alignment loss
-        # ------------------------------
+        # Cross Attention Alignment Loss
         alpha = 0.9
-        if self.cross_attention_maps_cache is None: self.cross_attention_maps_cache = cross_attention_maps.detach().clone()
-        else: self.cross_attention_maps_cache = self.cross_attention_maps_cache * alpha + cross_attention_maps.detach().clone() * (1 - alpha)
+        if self.cross_attention_maps_cache is None:
+            self.cross_attention_maps_cache = cross_attention_maps.detach().clone()
+        else:
+            self.cross_attention_maps_cache = self.cross_attention_maps_cache * alpha + cross_attention_maps.detach().clone() * (1 - alpha)
 
         cross_attn_alignment_loss = 0
         for i in indices:
             cross_attention_map_cur_token = cross_attention_maps[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
+            if smooth_attentions:
+                cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
             cross_attention_map_cur_token_cache = self.cross_attention_maps_cache[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token_cache = fn_smoothing_func(cross_attention_map_cur_token_cache)
-            cross_attn_alignment_loss = cross_attn_alignment_loss + torch.nn.L1Loss()(cross_attention_map_cur_token, cross_attention_map_cur_token_cache)          
+            if smooth_attentions:
+                cross_attention_map_cur_token_cache = fn_smoothing_func(cross_attention_map_cur_token_cache)
+            cross_attn_alignment_loss += torch.nn.L1Loss()(cross_attention_map_cur_token, cross_attention_map_cur_token_cache)
 
-        # ----------------------------
-        # self-attention conflict loss
-        # ----------------------------
-        self_attention_maps = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=False)
+        # Final Loss Calculation
+        lambda_IoU = 0.05  # Weight for IoU losses
+        joint_loss = (
+            L1 + L2 + 
+            clean_cross_attn_loss * 0.1 + 
+            cross_attn_alignment_loss * 0.1 +
+            # lambda_IoU * (IoU_max + IoU_upper_sum)
+            lambda_IoU * (IoU_upper_sum)
+        )
+        # IoU_loss=IoU_max + IoU_upper_sum
+        IoU_loss=IoU_upper_sum
+        IoU_loss=IoU_loss.clone().requires_grad_(True).to(self._execution_device)
+        # Ensure Loss Tensors Require Gradients
+        return joint_loss.requires_grad_(True), L1, clean_cross_attn_loss, L2
 
-        self_attention_map_list = []
-        for topk_coord_list in topk_coord_list_list:
-            self_attention_map_cur_token_list = []
-            for coord_x, coord_y in topk_coord_list:
 
-                self_attention_map_cur_token = self_attention_maps[coord_x, coord_y]
-                self_attention_map_cur_token = self_attention_map_cur_token.view(attention_res, attention_res).contiguous()
-                self_attention_map_cur_token_list.append(self_attention_map_cur_token)
 
-            if len(self_attention_map_cur_token_list) > 0:
-                self_attention_map_cur_token = sum(self_attention_map_cur_token_list) / len(self_attention_map_cur_token_list)
-                if smooth_attentions: self_attention_map_cur_token = fn_smoothing_func(self_attention_map_cur_token)
-            else:
-                self_attention_map_per_token = torch.zeros_like(self_attention_maps[0, 0])
-                self_attention_map_per_token = self_attention_map_per_token.view(attention_res, attention_res).contiguous()
 
-            self_attention_map_list.append(self_attention_map_cur_token)
-
-        self_attn_loss, number_self_attn_loss_pair = 0, 0
-        number_token = len(self_attention_map_list)
-        for i in range(number_token):
-            for j in range(i + 1, number_token): 
-                number_self_attn_loss_pair = number_self_attn_loss_pair + 1
-                self_attention_map_1 = self_attention_map_list[i]
-                self_attention_map_2 = self_attention_map_list[j]
-
-                self_attention_map_min = torch.min(self_attention_map_1, self_attention_map_2) 
-                self_attention_map_sum = (self_attention_map_1 + self_attention_map_2)
-                cur_self_attn_loss = (self_attention_map_min.sum() / (self_attention_map_sum.sum() + 1e-6))
-                self_attn_loss = self_attn_loss + cur_self_attn_loss
-
-        if number_self_attn_loss_pair > 0: self_attn_loss = self_attn_loss / number_self_attn_loss_pair
-
-        joint_loss = cross_attn_loss * 1. + clean_cross_attn_loss * 0.1 + cross_attn_alignment_loss * 0.1 + self_attn_loss * 1.
-        return joint_loss, cross_attn_loss, clean_cross_attn_loss, self_attn_loss
     
     def fn_calc_kld_loss_func(self, log_var, mu):
         return torch.mean(-0.5 * torch.mean(1 + log_var - mu ** 2 - log_var.exp()), dim=0)
-    
-    def fn_compute_loss(
+
+    def fn_our_compute_loss(
         self, 
+        prompt: str,
         indices: List[int], 
+        iteration,
         smooth_attentions: bool = True,
-        K: int = 1,
         attention_res: int = 16,) -> torch.Tensor:
         
         # -----------------------------
-        # cross-attention response loss
+        # L1
         # -----------------------------
         aggregate_cross_attention_maps = self.attention_store.aggregate_attention(
             from_where=("up", "down", "mid"), is_cross=True)
         
-        # cross attention map preprocessing
+        self_attention_maps = self.attention_store.aggregate_attention(
+            from_where=("up", "down", "mid"), is_cross=False)
+        # Cross attention map preprocessing
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 1:-1]
-        cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+        for i in range(cross_attention_maps.shape[2]):
+            layer = cross_attention_maps[:, :, i].clone()
+            min_val = layer.min()
+            max_val = layer.max()
+            cross_attention_maps[:, :, i] = (layer - min_val) / (max_val - min_val)
+
+        cross_attention_map_numpy, self_attention_map_numpy = fn_show_attention_numpy(
+                                cross_attention_maps=cross_attention_maps,
+                                self_attention_maps=self_attention_maps,
+                                indices=len(prompt.split()),
+                                K=1,
+                                attention_res=16,
+                                smooth_attentions=True)
+        np.save(f"outputs/{prompt}/{iteration}_cross_attention_maps_{prompt}.npy",cross_attention_map_numpy)
+#             
 
         # Shift indices since we removed the first token
         indices = [index - 1 for index in indices]
 
-        # clean_cross_attention_loss
-        clean_cross_attention_loss = 0.
+        cross_attention_map_tensor, self_attention_map_tensor = fn_show_attention(
+            cross_attention_maps=cross_attention_maps,
+            self_attention_maps=self_attention_maps,
+            indices=len(prompt.split()),
+            K=1,
+            attention_res=16,
+            smooth_attentions=True)
 
-        # Extract the maximum values
-        topk_value_list, topk_coord_list_list = [], []
+        # Perform GMM-based segmentation on the SA map
+        # print(self_attention_maps.shape)
+        prob_maps = self.GMM_on_SA_map(SA_map=self_attention_maps, num_components=len(indices) + 1)
+        SA_segments = self.separate_islands(prob_maps) 
+        SA_segments_tensor = SA_segments.clone().requires_grad_(True).to(self._execution_device)
+
+        # Initialize CA_maps tensor
+        CA_maps_tensor = torch.zeros((len(indices), 16, 16), dtype=torch.float32).clone().requires_grad_(True).to(self._execution_device)
+        
+        for idx, i in enumerate(indices):
+          # print(idx,i,type(cross_attention_map_tensor[16*i : 16*(i+1), :]))
+          CA_maps_tensor[idx] = cross_attention_map_tensor[16 * i: 16 * (i + 1), :].clone()
+
+        # Assign self-attention segments to noun-based CA mapss
+        assignments = self.assign_segments_to_nouns(SA_segments_tensor, CA_maps_tensor)
+
+        # Compute L1 Loss
+        losses = []
+        for seg_idx, noun_idx in assignments:
+            loss_segment = self.calculate_intersection(SA_segments_tensor[seg_idx], CA_maps_tensor[noun_idx])
+            loss_segment /= torch.sum(SA_segments_tensor[seg_idx])
+            losses.append(1 - loss_segment)
+        losses_tensor = torch.tensor(losses, requires_grad=True, device=self._execution_device)
+        L1 = torch.max(losses_tensor)
+
+        # Compute L2 Loss (Intersection Loss)
+        intersection_losses = []
+        for seg_idx, noun_idx in assignments:
+            loss_segment = sum(self.calculate_intersection(SA_segments_tensor[seg_idx], i) for i in CA_maps_tensor)
+            loss_segment -= self.calculate_intersection(SA_segments_tensor[seg_idx], CA_maps_tensor[noun_idx])
+            loss_segment /= torch.sum(SA_segments_tensor[seg_idx])
+            intersection_losses.append(loss_segment)
+
+        intersection_losses = self.clean_and_normalize(intersection_losses)
+        losses_tensor = torch.tensor(intersection_losses, requires_grad=True, device=self._execution_device)
+        L2 = torch.max(losses_tensor)
+
+        # -----------------------------
+        # IoU Loss
+        # -----------------------------
+        # Compute IoU Matrix
+        num_segments = SA_segments_tensor.shape[0]
+        IoU_matrix = torch.zeros((num_segments, num_segments), device=self._execution_device, requires_grad=True)
+
+        for i in range(num_segments):
+            for j in range(i + 1, num_segments):
+                intersection = torch.sum(torch.min(SA_segments_tensor[i], SA_segments_tensor[j]))
+                union = torch.sum(torch.max(SA_segments_tensor[i], SA_segments_tensor[j]))
+                IoU_matrix = IoU_matrix.clone() 
+                IoU_matrix[i, j] = intersection / union if union > 0 else 0
+        # IoU_loss = IoU_matrix.triu(1).sum() + IoU_matrix.max()
+        IoU_loss = torch.sum(torch.triu(IoU_matrix, diagonal=1)) 
+        # IoU_loss=IoU_loss
+        # IoU_loss = IoU_matrix.triu(1).sum() 
+
+        # -----------------------------
+        # Clean Cross Attention Loss
+        # -----------------------------
+        clean_cross_attention_loss = 0.
         for i in indices:
             cross_attention_map_cur_token = cross_attention_maps[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
+            if smooth_attentions:
+                cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
             
-            topk_coord_list, _ = fn_get_topk(cross_attention_map_cur_token, K=K)
-
-            topk_value = 0
-            for coord_x, coord_y in topk_coord_list: topk_value = topk_value + cross_attention_map_cur_token[coord_x, coord_y]
-            topk_value = topk_value / K
-
-            topk_value_list.append(topk_value)
-            topk_coord_list_list.append(topk_coord_list)
-
-            # -----------------------------------
-            # clean cross_attention_map_cur_token
-            # -----------------------------------
-            clean_cross_attention_map_cur_token                     = cross_attention_map_cur_token
-            clean_cross_attention_map_cur_token_mask                = fn_get_otsu_mask(clean_cross_attention_map_cur_token)
-            clean_cross_attention_map_cur_token_mask                = fn_clean_mask(clean_cross_attention_map_cur_token_mask, topk_coord_list[0][0], topk_coord_list[0][1])
+            topk_coord_list, _ = fn_get_topk(cross_attention_map_cur_token, K=1)
             
-            clean_cross_attention_map_cur_token_foreground          = clean_cross_attention_map_cur_token * clean_cross_attention_map_cur_token_mask + (1 - clean_cross_attention_map_cur_token_mask)
-            clean_cross_attention_map_cur_token_background          = clean_cross_attention_map_cur_token * (1 - clean_cross_attention_map_cur_token_mask)
+            # Clean cross_attention_map_cur_token
+            clean_cross_attention_map_cur_token = cross_attention_map_cur_token
+            clean_cross_attention_map_cur_token_mask = fn_get_otsu_mask(clean_cross_attention_map_cur_token)
+            clean_cross_attention_map_cur_token_mask = fn_clean_mask(clean_cross_attention_map_cur_token_mask, topk_coord_list[0][0], topk_coord_list[0][1])
+            
+            clean_cross_attention_map_cur_token_foreground = clean_cross_attention_map_cur_token * clean_cross_attention_map_cur_token_mask + (1 - clean_cross_attention_map_cur_token_mask)
+            clean_cross_attention_map_cur_token_background = clean_cross_attention_map_cur_token * (1 - clean_cross_attention_map_cur_token_mask)
 
             if clean_cross_attention_map_cur_token_background.max() > clean_cross_attention_map_cur_token_foreground.min():
-                clean_cross_attention_loss = clean_cross_attention_loss + clean_cross_attention_map_cur_token_background.max()
-            else: clean_cross_attention_loss = clean_cross_attention_loss + clean_cross_attention_map_cur_token_background.max() * 0
-
-        cross_attn_loss_list = [max(0 * curr_max, 1.0 - curr_max) for curr_max in topk_value_list]
-        cross_attn_loss = max(cross_attn_loss_list)
-
-        # ----------------------------
-        # self-attention conflict loss
-        # ----------------------------
-        self_attention_maps = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=False)
-        
-        self_attention_map_list = []
-        for topk_coord_list in topk_coord_list_list:
-            self_attention_map_cur_token_list = []
-            for coord_x, coord_y in topk_coord_list:
-
-                self_attention_map_cur_token = self_attention_maps[coord_x, coord_y]
-                self_attention_map_cur_token = self_attention_map_cur_token.view(attention_res, attention_res).contiguous()
-                self_attention_map_cur_token_list.append(self_attention_map_cur_token)
-
-            if len(self_attention_map_cur_token_list) > 0:
-                self_attention_map_cur_token = sum(self_attention_map_cur_token_list) / len(self_attention_map_cur_token_list)
-                if smooth_attentions: self_attention_map_cur_token = fn_smoothing_func(self_attention_map_cur_token)
+                clean_cross_attention_loss += clean_cross_attention_map_cur_token_background.max()
             else:
-                self_attention_map_per_token = torch.zeros_like(self_attention_maps[0, 0])
-                self_attention_map_per_token = self_attention_map_per_token.view(attention_res, attention_res).contiguous()
+                clean_cross_attention_loss += clean_cross_attention_map_cur_token_background.max() * 0
 
-            self_attention_map_list.append(self_attention_map_cur_token)
+        # Convert to tensors and ensure requires_grad
+        L1 = L1 * torch.ones(1).to(self._execution_device)
+        L2 = L2 * torch.ones(1).to(self._execution_device)
+        IoU_loss = IoU_loss * torch.ones(1).to(self._execution_device)
+        clean_cross_attention_loss = clean_cross_attention_loss * torch.ones(1).to(self._execution_device)
 
-        self_attn_loss, number_self_attn_loss_pair = 0, 0
-        number_token = len(self_attention_map_list)
-        for i in range(number_token):
-            for j in range(i + 1, number_token): 
-                number_self_attn_loss_pair = number_self_attn_loss_pair + 1
-                self_attention_map_1 = self_attention_map_list[i]
-                self_attention_map_2 = self_attention_map_list[j]
+        joint_loss = L1 + L2 + clean_cross_attention_loss + IoU_loss
+        for loss in [L1, L2, IoU_loss, clean_cross_attention_loss, joint_loss]:
+            if not loss.requires_grad:
+                loss = loss.clone().requires_grad_(True)
 
-                self_attention_map_min = torch.min(self_attention_map_1, self_attention_map_2) 
-                self_attention_map_sum = (self_attention_map_1 + self_attention_map_2) 
-                cur_self_attn_loss = (self_attention_map_min.sum() / (self_attention_map_sum.sum() + 1e-6))
-                self_attn_loss = self_attn_loss + cur_self_attn_loss
+        return joint_loss, L1, L2
 
-        if number_self_attn_loss_pair > 0: self_attn_loss = self_attn_loss / number_self_attn_loss_pair
 
-        cross_attn_loss = cross_attn_loss * torch.ones(1).to(self._execution_device)
-        self_attn_loss  = self_attn_loss * torch.ones(1).to(self._execution_device)
-
-        if cross_attn_loss > 0.5:    self_attn_loss = self_attn_loss * 0
-        joint_loss = cross_attn_loss * 1. +  self_attn_loss * 1. + clean_cross_attention_loss * 1.
-
-        return joint_loss, cross_attn_loss, self_attn_loss
+        
 
     @staticmethod
     def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float) -> torch.Tensor:
         """Update the latent according to the computed loss."""
-        grad_cond = torch.autograd.grad(loss.requires_grad_(True), [latents], retain_graph=True)[0]
-        latents = latents - step_size * grad_cond
-        return latents
+        # Ensure latents requires gradient
+        latents = latents.clone().detach().requires_grad_(True)
+        # print(latents.requires_grad)  # Should be True
+        # print(loss.requires_grad)     # Should be True
+        # Compute gradients
+        grad_cond = torch.autograd.grad(loss, latents, retain_graph=True, allow_unused=True)[0]
+
+        # Check if grad_cond is None
+        if grad_cond is None:
+            raise RuntimeError("Gradient computation returned None. Ensure loss is correctly computed from latents.")
+
+        # Update latents using the computed gradients
+        updated_latents = latents - step_size * grad_cond
+
+        return updated_latents
+    
+    # def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float) -> torch.Tensor:
+    #     """Update the latent according to the computed loss."""
+    #     old_latents=latents.clone()
+    #     grad_cond = torch.autograd.grad(loss.requires_grad_(True), [latents], retain_graph=True, allow_unused=True)[0]
+    #     print(old_latents==latents)
+    #     return latents
 
     def _perform_iterative_refinement_step(
         self,
         latents: torch.Tensor,
         indices: List[int],
+        prompt: str,
         cross_attn_loss: torch.Tensor,
         self_attn_loss: torch.Tensor,
         clean_loss: torch.Tensor,
@@ -765,19 +1123,30 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         target_self_loss = 0.3
         while cross_attn_loss > target_loss or self_attn_loss > target_self_loss:
             iteration += 1
-
-            latents = latents.clone().detach().requires_grad_(True)
+            latents = latents.requires_grad_(True)
+            # latents = latents.clone().detach().requires_grad_(True)
             self.unet(latents, t, encoder_hidden_states=text_embeddings).sample
             self.unet.zero_grad()
+            
+            joint_loss, cross_attn_loss, clean_loss, self_attn_loss= self.fn_our_augmented_compute_losss(indices=indices, prompt=prompt)
+            if joint_loss != 0: 
+                
+                latents = self._update_latent(latents, joint_loss, step_size)
 
-            joint_loss, cross_attn_loss, clean_loss, self_attn_loss = self.fn_augmented_compute_losss(indices=indices, K=1)
-            if joint_loss != 0: latents = self._update_latent(latents, joint_loss, step_size)
-
-            logging.info(f"\t Try {iteration}. cross loss: {cross_attn_loss:0.4f}. self loss: {self_attn_loss:0.4f}. clean loss: {clean_loss:0.4f}")
+            # Convert tensors to scalars before logging
+            logging.info(f"\t Try {iteration}. cross loss: {cross_attn_loss.item():0.4f}. self loss: {self_attn_loss.item():0.4f}. clean loss: {clean_loss.item():0.4f}")
 
             if iteration >= max_refinement_steps:
                 logging.info(f"\t Exceeded max number of iterations ({max_refinement_steps})! ")
                 break
+#             joint_loss, cross_attn_loss, clean_loss, self_attn_loss = self.fn_our_augmented_compute_losss(indices=indices, prompt=prompt)
+#             if joint_loss != 0: latents = self._update_latent(latents, joint_loss, step_size)
+
+#             logging.info(f"\t Try {iteration}. cross loss: {cross_attn_loss:0.4f}. self loss: {self_attn_loss:0.4f}. clean loss: {clean_loss:0.4f}")
+
+#             if iteration >= max_refinement_steps:
+#                 logging.info(f"\t Exceeded max number of iterations ({max_refinement_steps})! ")
+#                 break
 
         # Run one more time but don't compute gradients and update the latents.
         # We just need to compute the new loss - the grad update will occur below
@@ -785,108 +1154,148 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         _ = self.unet(latents, t, encoder_hidden_states=text_embeddings).sample
         self.unet.zero_grad()
         
-        joint_loss, cross_attn_loss, clean_loss, self_attn_loss = self.fn_augmented_compute_losss(indices=indices, K=1)
-        logging.info(f"\t Finished with loss of: {cross_attn_loss:0.4f}")
+        joint_loss, cross_attn_loss, clean_loss, self_attn_loss= self.fn_our_augmented_compute_losss(indices=indices, prompt=prompt)
+        logging.info(f"\t Finished with loss of: {cross_attn_loss.item():0.4f}")
         return joint_loss, cross_attn_loss, self_attn_loss, clean_loss, latents, None
 
     # InitNO: Boosting Text-to-Image Diffusion Models via Initial Noise Optimization
+    import os
     def fn_initno(
-        self,
-        latents: torch.Tensor,
-        indices: List[int],
-        text_embeddings: torch.Tensor,
+            self,
+            latents: torch.Tensor,
+            indices: List[int],
+            text_embeddings: torch.Tensor,
+            prompt: str,
+            use_grad_checkpoint: bool = False,
+            initno_lr: float = 1e-2,
+            max_step: int = 50,
+            round: int = 0,
+            tau_cross_attn: float = 0.2,
+            tau_self_attn: float = 0.3,
+            num_inference_steps: int = 50,
+            device: str = "",
+            denoising_step_for_loss: int = 5,
+            guidance_scale: int = 0,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            eta: float = 0.0,
+            do_classifier_free_guidance: bool = False,
+        ):
+          '''InitNO: Boosting Text-to-Image Diffusion Models via Initial Noise Optimization with Early Stopping'''
 
-        use_grad_checkpoint: bool = False,
-        initno_lr: float = 1e-2,
-        max_step: int = 50,
-        round: int = 0,
-        tau_cross_attn: float = 0.2,
-        tau_self_attn: float = 0.3,
-        num_inference_steps: int = 50,
-        device: str = "",
-        denoising_step_for_loss: int = 1,
-        guidance_scale: int = 0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        eta: float = 0.0,
-        do_classifier_free_guidance: bool = False,
-    ):
-        '''InitNO: Boosting Text-to-Image Diffusion Models via Initial Noise Optimization'''
+          latents = latents.clone().detach()
+          log_var, mu = torch.zeros_like(latents), torch.zeros_like(latents)
+          log_var, mu = log_var.clone().detach().requires_grad_(True), mu.clone().detach().requires_grad_(True)
+          optimizer = Adam([log_var, mu], lr=initno_lr, eps=1e-3)
 
-        latents = latents.clone().detach()
-        log_var, mu = torch.zeros_like(latents), torch.zeros_like(latents)
-        log_var, mu = log_var.clone().detach().requires_grad_(True), mu.clone().detach().requires_grad_(True)
-        optimizer = Adam([log_var, mu], lr=initno_lr, eps=1e-3)
+          extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+          
+          optimization_succeed = False
+          self_attention_maps_list = []
+          
+          prev_loss = float("inf")
+          no_improve_count = 0
+          early_stop_threshold = 5e-2  # Loss improvement threshold
+          patience = 4  # Stop if loss doesn't improve for `patience` steps
 
-        # Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+          # Log file setup
+          log_filename = f"{prompt.replace(' ', '_')}.log"  # Replace spaces with underscores
+          import os
+          log_filepath = os.path.join("logs", log_filename)  # Save in a "logs" folder
+          os.makedirs("logs", exist_ok=True)  # Ensure log directory exists
 
-        optimization_succeed = False
-        for iteration in tqdm(range(max_step)):
+          with open(log_filepath, "a") as log_file:  # Open file in append mode
+              log_file.write(f"\n--- New Run (Round {round}) ---\n")
 
-            optimized_latents = latents * (torch.exp(0.5 * log_var)) + mu
-            
-            # prepare scheduler
-            self.scheduler.set_timesteps(num_inference_steps, device=device)
-            timesteps = self.scheduler.timesteps
+          loss_evolution = []  # Store loss evolution
 
-            # loss records
-            joint_loss_list, cross_attn_loss_list, self_attn_loss_list = [], [], []
-            
-            # denoising loop
-            for i, t in enumerate(timesteps):
-                if i >= denoising_step_for_loss: break
+          for iteration in tqdm(range(max_step)):
 
-                # Forward pass of denoising with text conditioning
-                if use_grad_checkpoint:
-                    noise_pred_text = checkpoint.checkpoint(self.unet, optimized_latents, t, text_embeddings[1].unsqueeze(0), use_reentrant=False).sample
-                else: noise_pred_text = self.unet(optimized_latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+              optimized_latents = latents * (torch.exp(0.5 * log_var)) + mu
+              
+              # Prepare scheduler
+              fast_denoising_steps = num_inference_steps // 5
+              self.scheduler.set_timesteps(fast_denoising_steps, device=device)
+              timesteps = self.scheduler.timesteps
 
-                joint_loss, cross_attn_loss, self_attn_loss = self.fn_compute_loss(
-                    indices=indices, K=1)
-                joint_loss_list.append(joint_loss), cross_attn_loss_list.append(cross_attn_loss), self_attn_loss_list.append(self_attn_loss)
+              joint_loss_list, cross_attn_loss_list, self_attn_loss_list = [], [], []
+              
+              for i, t in enumerate(timesteps):
+                  if i >= denoising_step_for_loss: 
+                      break
 
-                if denoising_step_for_loss > 1:
-                    with torch.no_grad():
-                        if use_grad_checkpoint:
-                            noise_pred_uncond = checkpoint.checkpoint(self.unet, optimized_latents, t, text_embeddings[0].unsqueeze(0), use_reentrant=False).sample
-                        else: noise_pred_uncond = self.unet(optimized_latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
+                  # Forward pass with text conditioning
+                  noise_pred_text = (self.unet(optimized_latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+                                    if not use_grad_checkpoint else 
+                                    checkpoint.checkpoint(self.unet, optimized_latents, t, text_embeddings[1].unsqueeze(0), use_reentrant=False).sample)
 
-                    if do_classifier_free_guidance: noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                  joint_loss, cross_attn_loss, self_attn_loss = self.fn_our_compute_loss(
+                      indices=indices, prompt=prompt, iteration=i)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    optimized_latents = self.scheduler.step(noise_pred, t, optimized_latents, **extra_step_kwargs).prev_sample
-                
-            joint_loss      = sum(joint_loss_list) / denoising_step_for_loss
-            cross_attn_loss = max(cross_attn_loss_list)
-            self_attn_loss  = max(self_attn_loss_list)
-            
-            # print loss records
-            joint_loss_list         = [_.item() for _ in joint_loss_list]
-            cross_attn_loss_list    = [_.item() for _ in cross_attn_loss_list]
-            self_attn_loss_list     = [_.item() for _ in self_attn_loss_list]
+                  joint_loss_list.append(joint_loss)
+                  cross_attn_loss_list.append(cross_attn_loss)
+                  self_attn_loss_list.append(self_attn_loss)
 
-            if cross_attn_loss < tau_cross_attn and self_attn_loss < tau_self_attn:
-                optimization_succeed = True
-                break
-  
-            self.unet.zero_grad()
-            optimizer.zero_grad()
-            joint_loss = joint_loss.mean()
-            joint_loss.backward()
-            optimizer.step()
+                  if denoising_step_for_loss > 1:
+                      with torch.no_grad():
+                          noise_pred_uncond = (self.unet(optimized_latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
+                                              if not use_grad_checkpoint else 
+                                              checkpoint.checkpoint(self.unet, optimized_latents, t, text_embeddings[0].unsqueeze(0), use_reentrant=False).sample)
 
-            # update kld_loss = self.fn_calc_kld_loss_func(log_var, mu)
-            kld_loss = self.fn_calc_kld_loss_func(log_var, mu)
-            while kld_loss > 0.001:
-                optimizer.zero_grad()
-                kld_loss = kld_loss.mean()
-                kld_loss.backward()
-                optimizer.step()
-                kld_loss = self.fn_calc_kld_loss_func(log_var, mu)
+                          noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) if do_classifier_free_guidance else noise_pred_text
+                      
+                      optimized_latents = self.scheduler.step(noise_pred, t, optimized_latents, **extra_step_kwargs).prev_sample
+                      
+              joint_loss = sum(joint_loss_list) / denoising_step_for_loss
+              cross_attn_loss = max(cross_attn_loss_list)
+              self_attn_loss = max(self_attn_loss_list)
+              
+              total_loss = cross_attn_loss + self_attn_loss
+              
+              # Log losses
+              loss_entry = f"Iteration {iteration}: Joint Loss = {joint_loss.item():.6f}, Cross Attn Loss = {cross_attn_loss.item():.6f}, Self Attn Loss = {self_attn_loss.item():.6f}, Total Loss = {total_loss.item():.6f}"
+              loss_evolution.append(loss_entry)
 
-        optimized_latents = (latents * (torch.exp(0.5 * log_var)) + mu).clone().detach()
-        if self_attn_loss <= 1e-6: self_attn_loss = self_attn_loss + 1.
-        return optimized_latents, optimization_succeed, cross_attn_loss + self_attn_loss 
+              # Write loss evolution to file
+              with open(log_filepath, "a") as log_file:
+                  log_file.write(loss_entry + "\n")
+
+              # Early stopping logic
+              if prev_loss - joint_loss < early_stop_threshold:
+                  no_improve_count += 1
+              else:
+                  no_improve_count = 0
+              prev_loss = joint_loss
+
+              if no_improve_count >= patience:
+                  print(f"Early stopping at iteration {iteration}")
+                  break
+
+              # Check convergence criteria
+              if cross_attn_loss < tau_cross_attn and self_attn_loss < tau_self_attn:
+                  optimization_succeed = True
+                  break
+
+              # Perform gradient update
+              self.unet.zero_grad()
+              optimizer.zero_grad()
+              joint_loss = joint_loss.mean()
+              joint_loss.backward()
+              optimizer.step()
+
+              # Ensure KL divergence constraint
+              kld_loss = self.fn_calc_kld_loss_func(log_var, mu)
+              while kld_loss > 0.001:
+                  optimizer.zero_grad()
+                  kld_loss = kld_loss.mean()
+                  kld_loss.backward()
+                  optimizer.step()
+                  kld_loss = self.fn_calc_kld_loss_func(log_var, mu)
+
+          optimized_latents = (latents * (torch.exp(0.5 * log_var)) + mu).clone().detach()
+          if self_attn_loss <= 1e-6:
+              self_attn_loss += 1.
+
+          return optimized_latents, optimization_succeed, total_loss, self_attention_maps_list
 
     def register_attention_control(self):
         attn_procs = {}
@@ -912,6 +1321,10 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         ids = self.tokenizer(prompt).input_ids
         indices = {i: tok for tok, i in zip(self.tokenizer.convert_ids_to_tokens(ids), range(len(ids)))}
         return indices
+
+    
+    
+
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -946,6 +1359,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         run_sd: bool = True,
         run_initno: bool = True
     ):
+        # )-> Tuple[Image.Image,np.ndarray,np.array]:
         r"""
         The call function to the pipeline for generation.
 
@@ -1028,7 +1442,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
-
+        output_folder_name= prompt.split(".")[0]
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
@@ -1073,6 +1487,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
         # 4. Prepare timesteps
+        num_inference_steps=num_inference_steps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
@@ -1117,67 +1532,74 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # 8. initno
-        run_initno = True
+        # run_initno = True
         if run_initno:
-            max_round = 5
-            with torch.enable_grad():
-                optimized_latents_pool = []
-                for round in range(max_round):
-                    optimized_latents, optimization_succeed, cross_self_attn_loss = self.fn_initno(
-                        latents=latents,
-                        indices=token_indices[0],
-                        text_embeddings=prompt_embeds,
-                        max_step=10,
-                        num_inference_steps=num_inference_steps,
-                        device=device,
-                        guidance_scale=guidance_scale,
-                        generator=generator,
-                        eta=eta,
-                        do_classifier_free_guidance=do_classifier_free_guidance,
-                        round=round,
-                    )
-                    optimized_latents_pool.append((cross_self_attn_loss, round, optimized_latents.clone(), latents.clone(), optimization_succeed))
-                    if optimization_succeed: break
-            
-                    latents = self.prepare_latents(
-                        batch_size * num_images_per_prompt,
-                        num_channels_latents,
-                        height,
-                        width,
-                        prompt_embeds.dtype,
-                        device,
-                        generator,
-                        latents=None,
-                    )
-                optimized_latents_pool.sort()
-                # for score, _round, _optimized_latent, _latent, _optimization_succeed in optimized_latents_pool: 
-                #     print(f'Optimization_succeed: {_optimization_succeed} - Attn score: {score.item():0.4f} - Round: {_round}')
-                
-                if optimized_latents_pool[0][4] is True:
-                    latents = optimized_latents_pool[0][2]
-                else:
-                    optimized_latents, optimization_succeed, cross_self_attn_loss = self.fn_initno(
-                        latents=optimized_latents_pool[0][3],
-                        indices=token_indices[0],
-                        text_embeddings=prompt_embeds,
-                        max_step=50,
-                        num_inference_steps=num_inference_steps,
-                        device=device,
-                        guidance_scale=guidance_scale,
-                        generator=generator,
-                        eta=eta,
-                        do_classifier_free_guidance=do_classifier_free_guidance,
-                        round=round,
-                    ) 
-                    latents = optimized_latents
-                
+          max_round = 3  # Three re-initializations
+          with torch.enable_grad():
+              optimized_latents_pool = []
 
+              for round in range(max_round):
+                  optimized_latents, optimization_succeed, cross_self_attn_loss, self_attention_maps_list = self.fn_initno(
+                      latents=latents,
+                      indices=token_indices[0],
+                      text_embeddings=prompt_embeds,  # Use float16
+                      prompt=prompt,
+                      max_step=15,  # Reduce steps initially
+                      num_inference_steps=num_inference_steps,
+                      device=device,
+                      guidance_scale=guidance_scale,
+                      generator=generator,
+                      eta=eta,
+                      do_classifier_free_guidance=do_classifier_free_guidance,
+                      round=round,
+                  )
+                  optimized_latents_pool.append((cross_self_attn_loss, round, optimized_latents.clone(), latents.clone(), optimization_succeed))
+
+                  if optimization_succeed:
+                      break  # Stop if an optimized solution is found
+                  latents = self.prepare_latents(
+                      batch_size * num_images_per_prompt,
+                      num_channels_latents,
+                      height,
+                      width,
+                      prompt_embeds.dtype,
+                      device,
+                      generator,
+                      latents=None,
+                  )
+
+              # Sort results by lowest loss
+              optimized_latents_pool.sort(key=lambda x: x[0])  
+
+              # Always pick the latent with the lowest loss, regardless of optimization success
+              best_latents = optimized_latents_pool[0][2]
+
+              # Further refine the best latents for 50 rounds
+              refined_latents, optimization_succeed, _, _ = self.fn_initno(
+                  latents=best_latents,
+                  indices=token_indices[0],
+                  text_embeddings=prompt_embeds,
+                  prompt=prompt,
+                  max_step=50,
+                  num_inference_steps=num_inference_steps,
+                  device=device,
+                  guidance_scale=guidance_scale,
+                  generator=generator,
+                  eta=eta,
+                  do_classifier_free_guidance=do_classifier_free_guidance,
+                  round=round,
+              )
+
+              latents = refined_latents
+
+
+                
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
         # store attention map
-        cross_attention_map_numpy_list, self_attention_map_numpy_list = [], []
+        cross_attention_map_numpy_list, self_attention_map_numpy_list= [], []
         with self.progress_bar(total=num_inference_steps) as progress_bar:
 
             for i, t in enumerate(timesteps):
@@ -1199,7 +1621,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
                         ).sample
                         self.unet.zero_grad()
 
-                        joint_loss, cross_attn_loss, clean_loss, self_attn_loss = self.fn_augmented_compute_losss(indices=index, K=1)
+                        joint_loss, cross_attn_loss, clean_loss, self_attn_loss= self.fn_our_augmented_compute_losss(indices=index,prompt=prompt)
 
                         if result_root is not None:
                             
@@ -1207,42 +1629,45 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
                                 from_where=("up", "down", "mid"), is_cross=True)
                             self_attention_maps = self.attention_store.aggregate_attention(
                                 from_where=("up", "down", "mid"), is_cross=False)
+                            # output_folder_name=prompt.replace(" ","_")
+                            torch.save(self_attention_maps,f"outputs/{output_folder_name}/self_attention_maps_{output_folder_name}_{seed}.pt")
                             
-                            cross_attention_map_numpy, self_attention_map_numpy = fn_show_attention(
+                            cross_attention_map_numpy, self_attention_map_numpy = fn_show_attention_numpy(
                                 cross_attention_maps=cross_attention_maps,
                                 self_attention_maps=self_attention_maps,
-                                indices=index,
+                                indices=len(prompt.split()),
                                 K=1,
                                 attention_res=16,
                                 smooth_attentions=True)
 
-                            cross_attention_map_numpy_list.append(cross_attention_map_numpy)
+                            cross_attention_map_numpy_list.append(cross_attention_map_numpy) 
                             self_attention_map_numpy_list.append(self_attention_map_numpy)
-
-                        # If this is an iterative refinement step, verify we have reached the desired threshold for all
-                        if i < max_iter_to_alter and (i == 10 or i == 20) and (cross_attn_loss > 0.2 or self_attn_loss > 0.3) and not run_sd and True:
                         
-                            joint_loss, cross_attn_loss, self_attn_loss, clean_loss, latent, max_attention_per_index = self._perform_iterative_refinement_step(
-                                latents=latent,
-                                indices=index,
-                                cross_attn_loss=cross_attn_loss,
-                                self_attn_loss=self_attn_loss,
-                                clean_loss=clean_loss,
-                                threshold=0.8,
-                                text_embeddings=text_embedding,
-                                step_size=step_size[i],
-                                t=t,
-                            )
-
-                        # Perform gradient update
-                        if i < max_iter_to_alter and not run_sd:
-                            if cross_attn_loss != 0 and True:
-                                latent = self._update_latent(
-                                    latents=latent,
-                                    loss=cross_attn_loss,
-                                    step_size=step_size[i],
-                                )
-                            # logging.info(f"Iteration {i:02d} - cross loss: {cross_attn_loss:0.4f} - self loss: {self_attn_loss:0.4f}")
+#                         # If this is an iterative refinement step, verify we have reached the desired threshold for all
+#                         if i < max_iter_to_alter and (i == 10 or i == 20) and (cross_attn_loss > 0.2 or self_attn_loss > 0.3) and not run_sd and True:
+                           
+#                             joint_loss, cross_attn_loss, self_attn_loss, clean_loss, latent, max_attention_per_index = self._perform_iterative_refinement_step(
+#                                 latents=latent,
+#                                 indices=index,
+#                                 prompt=prompt,
+#                                 cross_attn_loss=cross_attn_loss,
+#                                 self_attn_loss=self_attn_loss,
+#                                 clean_loss=clean_loss,
+#                                 threshold=0.8,
+#                                 text_embeddings=text_embedding,
+#                                 step_size=step_size[i],
+#                                 t=t,
+#                             )
+                       
+#                         # Perform gradient update
+#                         if i < max_iter_to_alter and not run_sd:
+#                             if cross_attn_loss != 0 and True:
+#                                 latent = self._update_latent(
+#                                     latents=latent,
+#                                     loss=cross_attn_loss,
+#                                     step_size=step_size[i],
+#                                 )
+#                             # logging.info(f"Iteration {i:02d} - cross loss: {cross_attn_loss:0.4f} - self loss: {self_attn_loss:0.4f}")
 
                         updated_latents.append(latent)
 
@@ -1274,20 +1699,45 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+                np.save(f"outputs/{output_folder_name}/cross_attention_maps_{output_folder_name}_{seed}.npy",cross_attention_map_numpy_list)
+#             cross_attention_map_numpy_list1=[]
+#             self_attention_map_numpy_list1=[]
+#             #show cross attention for t=49 corresponding to relevant token indices
+#             attention_maps=cross_attention_map_numpy_list[49]
+#             np.save(f"/sensei-fs/tenants/Sensei-AdobeResearchTeam/share-aishagar/newintern/CLIP/Attend-and-Excite/OurNO/outputs/{output_folder_name}/cross_attention_maps_{output_folder_name}_{seed}.npy",cross_attention_map_numpy_list)
+#             for out1,out2 in zip(cross_attention_map_numpy_list,self_attention_map_numpy_list):
+#                 min_val = np.min(out1)
+#                 max_val = np.max(out1)
+#                 normalized_out1 = (out1 - min_val) / (max_val - min_val)
 
-            # show attention map at each timestep
-            if result_root is not None:
-                cross_attention_map_numpy       = np.concatenate(cross_attention_map_numpy_list, axis=-1)
-                self_attention_map_numpy        = np.concatenate(self_attention_map_numpy_list, axis=-1)
+#                 min_val = np.min(out2)
+#                 max_val = np.max(out2)
+#                 normalized_out2 = (out2 - min_val) / (max_val - min_val)
+                
+#                 normalized_out1=(normalized_out1>0.3).astype(int)
+                
+#                 normalized_out2=(normalized_out2>0.3).astype(int)
+                
+#                 cross_attention_map_numpy_list1.append(normalized_out1)
+#                 self_attention_map_numpy_list1.append(normalized_out2)
+                
+             
+#             # show attention map at each timestep
+#             if result_root is not None:
+#                 cross_attention_map_numpy       = np.concatenate(cross_attention_map_numpy_list1, axis=-1)
+#                 self_attention_map_numpy        = np.concatenate(self_attention_map_numpy_list1, axis=-1)
+          
+#                 SA_map=np.zeros((16,16))
+#                 for n in range(5):
+#                     SA_map=np.logical_or(SA_map, self_attention_map_numpy_list1[49][16*n:16*n+16][:]).astype(int)            
+#                 attention_map_numpy = np.concatenate((cross_attention_map_numpy, self_attention_map_numpy), axis=0)
 
-                attention_map_numpy = np.concatenate((cross_attention_map_numpy, self_attention_map_numpy), axis=0)
-
-                plt.axis('off')
-                plt.xticks([])
-                plt.yticks([])
-                plt.imshow(attention_map_numpy, cmap='YlOrRd')
-                plt.savefig(f"./{result_root}/{prompt}_{seed}_attn.jpg", dpi=600, bbox_inches='tight', pad_inches=0)
-                plt.close()
+#                 plt.axis('off')
+#                 plt.xticks([])
+#                 plt.yticks([])
+#                 plt.imshow(attention_map_numpy, cmap='YlOrRd')
+#                 plt.savefig(f"./outputs/{output_folder_name}/{output_folder_name}_{seed}_attn.jpg", dpi=600, bbox_inches='tight', pad_inches=0)
+#                 plt.close()
 
         # 8. Post-processing
         if not output_type == "latent":
@@ -1308,4 +1758,6 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         if not return_dict:
             return (image, has_nsfw_concept)
 
+        # return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept),cross_attention_map_numpy_list1,self_attention_map_numpy_list1
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+

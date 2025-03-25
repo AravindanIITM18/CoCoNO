@@ -3,7 +3,12 @@ import torch
 from torch.nn import functional as F
 
 from utils.gaussian_smoothing import GaussianSmoothing
+from PIL import Image
 
+import matplotlib.pyplot as plt
+
+from scipy.ndimage import label
+import cv2
 
 def fn_get_topk(attention_map, K=1):
     H, W = attention_map.size()
@@ -24,16 +29,77 @@ def fn_smoothing_func(attention_map):
     attention_map = smoothing(attention_map).squeeze(0).squeeze(0)
     return attention_map
 
-
 def fn_show_attention(
     cross_attention_maps,
     self_attention_maps,
     indices,
     K=1,
-    attention_res=16,
+    attention_res=32,
     smooth_attentions=True,
 ):
+    temp = [i for i in range(1, indices + 1)]
+    indices = temp
+    cross_attention_map_list, self_attention_map_list = [], []
 
+    # Cross attention map preprocessing
+    cross_attention_maps = cross_attention_maps[:, :, 1:-1]
+    for i in range(cross_attention_maps.shape[2]):
+        layer = cross_attention_maps[:, :, i].clone()
+        min_val = layer.min()
+        max_val = layer.max()
+        cross_attention_maps[:, :, i] = (layer - min_val) / (max_val - min_val)
+    # cross_attention_maps = cross_attention_maps * 100
+    # cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+
+    # Shift indices since we removed the first token
+    indices = [index - 1 for index in indices]
+
+    for i in indices:
+        cross_attention_map_per_token = cross_attention_maps[:, :, i]
+        if smooth_attentions:
+            cross_attention_map_per_token = fn_smoothing_func(cross_attention_map_per_token)
+        cross_attention_map_list.append(cross_attention_map_per_token)
+
+    for i in indices:
+        cross_attention_map_per_token = cross_attention_maps[:, :, i]
+        topk_coord_list, topk_value = fn_get_topk(cross_attention_map_per_token, K=K)
+
+        self_attention_map_per_token_list = []
+        for coord_x, coord_y in topk_coord_list:
+            self_attention_map_per_token = self_attention_maps[coord_x, coord_y]
+            self_attention_map_per_token = self_attention_map_per_token.view(attention_res, attention_res).contiguous()
+            self_attention_map_per_token_list.append(self_attention_map_per_token)
+
+        if len(self_attention_map_per_token_list) > 0:
+            self_attention_map_per_token = sum(self_attention_map_per_token_list) / len(self_attention_map_per_token_list)
+            if smooth_attentions:
+                self_attention_map_per_token = fn_smoothing_func(self_attention_map_per_token)
+        else:
+            self_attention_map_per_token = torch.zeros_like(self_attention_maps[0, 0])
+            self_attention_map_per_token = self_attention_map_per_token.view(attention_res, attention_res).contiguous()
+
+        norm_self_attention_map_per_token = (self_attention_map_per_token - self_attention_map_per_token.min()) / \
+            (self_attention_map_per_token.max() - self_attention_map_per_token.min() + 1e-6)
+        
+        self_attention_map_list.append(norm_self_attention_map_per_token)
+
+    # Tensor concatenation
+    cross_attention_map_tensor = torch.cat(cross_attention_map_list, dim=0)
+    self_attention_map_tensor = torch.cat(self_attention_map_list, dim=0)
+
+    return cross_attention_map_tensor, self_attention_map_tensor
+def fn_show_attention_numpy(
+    # prompt,
+    cross_attention_maps,
+    self_attention_maps,
+    indices,
+    K=1,
+    attention_res=32,
+    smooth_attentions=True,
+):
+    temp=[i for i in range(1,indices+1)]
+    indices=temp
+    # indices=[2,5]
     cross_attention_map_list, self_attention_map_list = [], []
 
     # cross attention map preprocessing
@@ -48,7 +114,13 @@ def fn_show_attention(
         cross_attention_map_per_token = cross_attention_maps[:, :, i]
         if smooth_attentions: cross_attention_map_per_token = fn_smoothing_func(cross_attention_map_per_token)
         cross_attention_map_list.append(cross_attention_map_per_token)
-
+        # cross_attention_map=cross_attention_map_per_token.detach().cpu().numpy()
+        # # Create the heatmap
+        # plt.imshow(cross_attention_map, cmap='coolwarm', interpolation='nearest')
+        # plt.colorbar()  # Add a colorbar to show the scale
+        # plt.title(f"Cross Attention Map Heatmap of {prompt.split()[i]}")
+        # plt.axis('off')  # Remove axis labels
+        # plt.show()
     for i in indices:
         cross_attention_map_per_token = cross_attention_maps[:, :, i]
         topk_coord_list, topk_value = fn_get_topk(cross_attention_map_per_token, K=K)
@@ -71,7 +143,8 @@ def fn_show_attention(
             (self_attention_map_per_token.max() - self_attention_map_per_token.min() + 1e-6)
         
         self_attention_map_list.append(norm_self_attention_map_per_token)
-
+        
+    
     # tensor to numpy
     cross_attention_map_numpy       = torch.cat(cross_attention_map_list, dim=0).cpu().detach().numpy()
     self_attention_map_numpy        = torch.cat(self_attention_map_list, dim=0).cpu().detach().numpy()
@@ -82,12 +155,17 @@ def fn_show_attention(
 import cv2
 
 def fn_get_otsu_mask(x):
+    
+    # Ensure x is a tensor
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=torch.float32)
 
-    x_numpy = x
-    x_numpy = x_numpy.cpu().detach().numpy()
+    # Move tensor to CPU and convert to NumPy array
+    x_numpy = x.cpu().detach().numpy()
+
     x_numpy = x_numpy * 255
     x_numpy = x_numpy.astype(np.uint16)
-
+    
     opencv_threshold, _ = cv2.threshold(x_numpy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     opencv_threshold = opencv_threshold * 1. / 255.
 
@@ -97,6 +175,23 @@ def fn_get_otsu_mask(x):
         torch.tensor(1, dtype=x.dtype, device=x.device))
     
     return otsu_mask
+
+# def fn_get_otsu_mask(x):
+
+#     x_numpy = x
+#     x_numpy = x_numpy.cpu().detach().numpy()
+#     x_numpy = x_numpy * 255
+#     x_numpy = x_numpy.astype(np.uint16)
+
+#     opencv_threshold, _ = cv2.threshold(x_numpy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+#     opencv_threshold = opencv_threshold * 1. / 255.
+
+#     otsu_mask = torch.where(
+#         x < opencv_threshold,
+#         torch.tensor(0, dtype=x.dtype, device=x.device),
+#         torch.tensor(1, dtype=x.dtype, device=x.device))
+    
+#     return otsu_mask
 
 
 def fn_clean_mask(otsu_mask, x, y):
